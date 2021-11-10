@@ -1,0 +1,20 @@
+{
+  "ECRPath": "string",
+  "ModelPath": "string",
+  "ModelName": "string",
+  "EndpointName": "string",
+  "EndpointConfigNameCanary": "string",
+  "EndpointConfigName": "string",
+  "ExecutionRoleArn": "string",
+  "VpcConfig": {
+    "SecurityGroupIds": ["string"],
+    "Subnets": ["string"]
+  },
+  "InstanceCount": 12345,
+  "InstanceType": "string",
+  "MinCapacity": 12345,
+  "MaxCapacity": 12345,
+  "TargetValue": 12345,
+  "ScaleInCooldown": 12345,
+  "ScaleOutCooldown": 12345
+}

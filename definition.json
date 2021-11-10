@@ -1,0 +1,478 @@
+{
+  "StartAt": "CreateModel",
+  "States": {
+    "CreateModel": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createModel",
+      "Parameters": {
+        "Containers": [
+          {
+            "Environment": {
+              "MODEL_ENV": "development"
+            },
+            "Image.$": "$$.Execution.Input.ECRPath",
+            "ImageConfig": {
+              "RepositoryAccessMode": "Platform"
+            },
+            "Mode": "SingleModel",
+            "ModelDataUrl.$": "$$.Execution.Input.ModelPath"
+          }
+        ],
+        "EnableNetworkIsolation": false,
+        "ExecutionRoleArn.$": "$$.Execution.Input.ExecutionRoleArn",
+        "ModelName.$": "$$.Execution.Input.ModelName",
+        "VpcConfig": {
+          "SecurityGroupIds.$": "$$.Execution.Input.VpcConfig.SecurityGroupIds",
+          "Subnets.$": "$$.Execution.Input.VpcConfig.Subnets"
+        }
+      },
+      "Next": "CheckEndpoint"
+    },
+    "CheckEndpoint": {
+      "Type": "Task",
+      "Next": "GetOriginalModelName",
+      "Parameters": {
+        "EndpointName.$": "$$.Execution.Input.EndpointName"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeEndpoint",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CreateEndpointConfig"
+        }
+      ]
+    },
+    "GetOriginalModelName": {
+      "Type": "Task",
+      "Next": "CreateCanaryEndpointConfig",
+      "Parameters": {
+        "EndpointConfigName.$": "$.EndpointConfigName"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeEndpointConfig",
+      "ResultSelector": {
+        "OriginalEndpointConfigName.$": "$.EndpointConfigName",
+        "OriginalModelName.$": "$.ProductionVariants[0].ModelName"
+      }
+    },
+    "CreateEndpointConfig": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+      "Parameters": {
+        "EndpointConfigName.$": "$$.Execution.Input.EndpointConfigName",
+        "ProductionVariants": [
+          {
+            "InitialInstanceCount.$": "$$.Execution.Input.InstanceCount",
+            "InitialVariantWeight": 1,
+            "InstanceType.$": "$$.Execution.Input.InstanceType",
+            "ModelName.$": "$$.Execution.Input.ModelName",
+            "VariantName": "Origin"
+          }
+        ]
+      },
+      "Next": "CreateEndpoint"
+    },
+    "CreateCanaryEndpointConfig": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+      "Parameters": {
+        "EndpointConfigName.$": "$$.Execution.Input.EndpointConfigNameCanary",
+        "ProductionVariants": [
+          {
+            "InitialInstanceCount.$": "$$.Execution.Input.InstanceCount",
+            "InitialVariantWeight": 0.2,
+            "InstanceType.$": "$$.Execution.Input.InstanceType",
+            "ModelName.$": "$$.Execution.Input.ModelName",
+            "VariantName": "Canary"
+          },
+          {
+            "InitialInstanceCount.$": "$$.Execution.Input.InstanceCount",
+            "InitialVariantWeight": 0.8,
+            "InstanceType.$": "$$.Execution.Input.InstanceType",
+            "ModelName.$": "$.OriginalModelName",
+            "VariantName": "Origin"
+          }
+        ]
+      },
+      "Next": "UpdateEndpoint",
+      "ResultPath": "$.Result"
+    },
+    "UpdateEndpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:updateEndpoint",
+      "Parameters": {
+        "EndpointConfigName.$": "$$.Execution.Input.EndpointConfigNameCanary",
+        "EndpointName.$": "$$.Execution.Input.EndpointName",
+        "RetainAllVariantProperties": false
+      },
+      "Next": "WaitDeployEndpoint1",
+      "ResultPath": "$.Result",
+      "InputPath": "$.Result"
+    },
+    "WaitDeployEndpoint1": {
+      "Type": "Task",
+      "Next": "CheckDeployStatus1",
+      "Parameters": {
+        "EndpointName.$": "$$.Execution.Input.EndpointName"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeEndpoint",
+      "InputPath": "$.Result",
+      "ResultPath": "$.Result"
+    },
+    "CheckDeployStatus1": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Not": {
+            "Variable": "$.Result.EndpointStatus",
+            "StringEquals": "InService"
+          },
+          "Next": "WaitDeploy1"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.Result.EndpointStatus",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.Result.EndpointStatus",
+              "StringEquals": "RollingBack"
+            }
+          ],
+          "Next": "DeployFail"
+        }
+      ],
+      "Default": "CreateCanaryVariantAlarms"
+    },
+    "CreateCanaryVariantAlarms": {
+      "Type": "Parallel",
+      "Next": "AutoScaleSettings",
+      "Branches": [
+        {
+          "StartAt": "Create5xxAlarm",
+          "States": {
+            "Create5xxAlarm": {
+              "Type": "Task",
+              "End": true,
+              "Parameters": {
+                "ComparisonOperator": "GreaterThanThreshold",
+                "EvaluationPeriods": 1,
+                "Threshold": 1,
+                "AlarmName": "SageMakerEndpointCanary5xx",
+                "ActionsEnabled": true,
+                "MetricName": "Invocation5XXErrors",
+                "Namespace": "AWS/SageMaker",
+                "Statistic": "Sum",
+                "Dimensions": [
+                  {
+                    "Name": "EndpointName",
+                    "Value.$": "$$.Execution.Input.EndpointName"
+                  },
+                  {
+                    "Name": "VariantName",
+                    "Value": "Canary"
+                  }
+                ],
+                "Period": 300,
+                "DatapointsToAlarm": 1,
+                "TreatMissingData": "notBreaching"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricAlarm"
+            }
+          }
+        },
+        {
+          "StartAt": "Create4xxAlarm",
+          "States": {
+            "Create4xxAlarm": {
+              "Type": "Task",
+              "End": true,
+              "Parameters": {
+                "ComparisonOperator": "GreaterThanThreshold",
+                "EvaluationPeriods": 1,
+                "Threshold": 1,
+                "AlarmName": "SageMakerEndpointCanary4xx",
+                "ActionsEnabled": true,
+                "MetricName": "Invocation4XXErrors",
+                "Namespace": "AWS/SageMaker",
+                "Statistic": "Sum",
+                "Dimensions": [
+                  {
+                    "Name": "EndpointName",
+                    "Value.$": "$$.Execution.Input.EndpointName"
+                  },
+                  {
+                    "Name": "VariantName",
+                    "Value": "Canary"
+                  }
+                ],
+                "Period": 300,
+                "DatapointsToAlarm": 1,
+                "TreatMissingData": "notBreaching"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatch:putMetricAlarm"
+            }
+          }
+        }
+      ],
+      "InputPath": "$.Result",
+      "ResultPath": "$.Result"
+    },
+    "AutoScaleSettings": {
+      "Type": "Parallel",
+      "Next": "Wait",
+      "Branches": [
+        {
+          "StartAt": "RegisterCanaryVariant",
+          "States": {
+            "RegisterCanaryVariant": {
+              "Type": "Task",
+              "Parameters": {
+                "ServiceNamespace": "sagemaker",
+                "ResourceId.$": "States.Format('endpoint/{}/variant/Canary', $$.Execution.Input.EndpointName)",
+                "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+                "MinCapacity.$": "$$.Execution.Input.MinCapacity",
+                "MaxCapacity.$": "$$.Execution.Input.MaxCapacity"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:applicationautoscaling:registerScalableTarget",
+              "Next": "PutCanaryVariantScalingPolicy"
+            },
+            "PutCanaryVariantScalingPolicy": {
+              "Type": "Task",
+              "Parameters": {
+                "PolicyName": "SageMakerEndpointInvocationScalingPolicy",
+                "PolicyType": "TargetTrackingScaling",
+                "ResourceId.$": "States.Format('endpoint/{}/variant/Canary', $$.Execution.Input.EndpointName)",
+                "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+                "ServiceNamespace": "sagemaker",
+                "TargetTrackingScalingPolicyConfiguration": {
+                  "TargetValue.$": "$$.Execution.Input.TargetValue",
+                  "PredefinedMetricSpecification": {
+                    "PredefinedMetricType": "SageMakerVariantInvocationsPerInstance"
+                  },
+                  "ScaleInCooldown.$": "$$.Execution.Input.ScaleInCooldown",
+                  "ScaleOutCooldown.$": "$$.Execution.Input.ScaleOutCooldown"
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:applicationautoscaling:putScalingPolicy",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "RegisterOriginVariant",
+          "States": {
+            "RegisterOriginVariant": {
+              "Type": "Task",
+              "Parameters": {
+                "ServiceNamespace": "sagemaker",
+                "ResourceId.$": "States.Format('endpoint/{}/variant/Origin', $$.Execution.Input.EndpointName)",
+                "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+                "MinCapacity.$": "$$.Execution.Input.MinCapacity",
+                "MaxCapacity.$": "$$.Execution.Input.MaxCapacity"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:applicationautoscaling:registerScalableTarget",
+              "Next": "PutOriginVariantScalingPolicy"
+            },
+            "PutOriginVariantScalingPolicy": {
+              "Type": "Task",
+              "Parameters": {
+                "PolicyName": "SageMakerEndpointInvocationScalingPolicy",
+                "PolicyType": "TargetTrackingScaling",
+                "ResourceId.$": "States.Format('endpoint/{}/variant/Origin', $$.Execution.Input.EndpointName)",
+                "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+                "ServiceNamespace": "sagemaker",
+                "TargetTrackingScalingPolicyConfiguration": {
+                  "TargetValue.$": "$$.Execution.Input.TargetValue",
+                  "PredefinedMetricSpecification": {
+                    "PredefinedMetricType": "SageMakerVariantInvocationsPerInstance"
+                  },
+                  "ScaleInCooldown.$": "$$.Execution.Input.ScaleInCooldown",
+                  "ScaleOutCooldown.$": "$$.Execution.Input.ScaleOutCooldown"
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:applicationautoscaling:putScalingPolicy",
+              "End": true
+            }
+          }
+        }
+      ],
+      "InputPath": "$.Result",
+      "ResultPath": "$.Result"
+    },
+    "WaitDeploy1": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "WaitDeployEndpoint1"
+    },
+    "Wait": {
+      "Type": "Wait",
+      "Seconds": 1200,
+      "Next": "CheckAlarms"
+    },
+    "CheckAlarms": {
+      "Type": "Task",
+      "Next": "RollbackJudge",
+      "Parameters": {
+        "AlarmNames": [
+          "SageMakerEndpointCanary4xx",
+          "SageMakerEndpointCanary5xx"
+        ]
+      },
+      "Resource": "arn:aws:states:::aws-sdk:cloudwatch:describeAlarms",
+      "InputPath": "$.Result",
+      "ResultPath": "$.Result"
+    },
+    "RollbackJudge": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Or": [
+            {
+              "Variable": "$.Result.MetricAlarms[0].StateValue",
+              "StringEquals": "ALARM"
+            },
+            {
+              "Variable": "$.Result.MetricAlarms[1].StateValue",
+              "StringEquals": "ALARM"
+            }
+          ],
+          "Next": "Rollback"
+        }
+      ],
+      "Default": "CreateNewModelEndpointConfig"
+    },
+    "CreateNewModelEndpointConfig": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createEndpointConfig",
+      "Parameters": {
+        "EndpointConfigName.$": "$$.Execution.Input.EndpointConfigName",
+        "ProductionVariants": [
+          {
+            "InitialInstanceCount.$": "$$.Execution.Input.InstanceCount",
+            "InitialVariantWeight": 1,
+            "InstanceType.$": "$$.Execution.Input.InstanceType",
+            "ModelName.$": "$$.Execution.Input.ModelName",
+            "VariantName": "Origin"
+          }
+        ]
+      },
+      "Next": "DeregisterCanaryVariant"
+    },
+    "DeregisterCanaryVariant": {
+      "Type": "Task",
+      "Next": "DeployNewModelEndpoint",
+      "Parameters": {
+        "ServiceNamespace": "sagemaker",
+        "ResourceId.$": "States.Format('endpoint/{}/variant/Canary', $$.Execution.Input.EndpointName)",
+        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:applicationautoscaling:deregisterScalableTarget"
+    },
+    "DeployNewModelEndpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:updateEndpoint",
+      "Parameters": {
+        "EndpointConfigName.$": "$$.Execution.Input.EndpointConfigName",
+        "EndpointName.$": "$$.Execution.Input.EndpointName",
+        "RetainAllVariantProperties": false
+      },
+      "Next": "WaitDeployEndpoint2"
+    },
+    "Rollback": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:updateEndpoint",
+      "Parameters": {
+        "EndpointConfigName.$": "$.OriginalEndpointConfigName",
+        "EndpointName.$": "$$.Execution.Input.EndpointName",
+        "RetainAllVariantProperties": false
+      },
+      "Next": "WaitDeployEndpoint2"
+    },
+    "RegisterScalableTarget": {
+      "Type": "Task",
+      "Next": "PutScalingPolicy",
+      "Parameters": {
+        "ServiceNamespace": "sagemaker",
+        "ResourceId.$": "States.Format('endpoint/{}/variant/Origin', $$.Execution.Input.EndpointName)",
+        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+        "MinCapacity.$": "$$.Execution.Input.MinCapacity",
+        "MaxCapacity.$": "$$.Execution.Input.MaxCapacity"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:applicationautoscaling:registerScalableTarget"
+    },
+    "PutScalingPolicy": {
+      "Type": "Task",
+      "End": true,
+      "Parameters": {
+        "PolicyName": "SageMakerEndpointInvocationScalingPolicy",
+        "PolicyType": "TargetTrackingScaling",
+        "ResourceId.$": "States.Format('endpoint/{}/variant/Origin', $$.Execution.Input.EndpointName)",
+        "ScalableDimension": "sagemaker:variant:DesiredInstanceCount",
+        "ServiceNamespace": "sagemaker",
+        "TargetTrackingScalingPolicyConfiguration": {
+          "TargetValue.$": "$$.Execution.Input.TargetValue",
+          "PredefinedMetricSpecification": {
+            "PredefinedMetricType": "SageMakerVariantInvocationsPerInstance"
+          },
+          "ScaleInCooldown.$": "$$.Execution.Input.ScaleInCooldown",
+          "ScaleOutCooldown.$": "$$.Execution.Input.ScaleOutCooldown"
+        }
+      },
+      "Resource": "arn:aws:states:::aws-sdk:applicationautoscaling:putScalingPolicy"
+    },
+    "CreateEndpoint": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sagemaker:createEndpoint",
+      "Parameters": {
+        "EndpointConfigName.$": "$$.Execution.Input.EndpointConfigName",
+        "EndpointName.$": "$$.Execution.Input.EndpointName"
+      },
+      "Next": "WaitDeployEndpoint2"
+    },
+    "WaitDeployEndpoint2": {
+      "Type": "Task",
+      "Next": "CheckDeployStatus2",
+      "Parameters": {
+        "EndpointName.$": "$$.Execution.Input.EndpointName"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:sagemaker:describeEndpoint"
+    },
+    "CheckDeployStatus2": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Not": {
+            "Variable": "$.EndpointStatus",
+            "StringEquals": "InService"
+          },
+          "Next": "WaitDeploy2"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.EndpointStatus",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.EndpointStatus",
+              "StringEquals": "RollingBack"
+            }
+          ],
+          "Next": "DeployFail"
+        }
+      ],
+      "Default": "RegisterScalableTarget"
+    },
+    "WaitDeploy2": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitDeployEndpoint2"
+    },
+    "DeployFail": {
+      "Type": "Fail"
+    }
+  }
+}
